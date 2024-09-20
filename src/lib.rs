@@ -206,7 +206,7 @@ fn list_interfaces() -> PyResult<Vec<String>> {
 }
 
 #[pymodule]
-fn pnet_sniffer(m: &Bound<'_, PyModule>) -> PyResult<()> {
+fn py_pnet(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PacketSniffer>()?;
     m.add_function(wrap_pyfunction!(list_interfaces, m)?)?;
     Ok(())

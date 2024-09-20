@@ -1,0 +1,50 @@
+name: Build Windows Wheels
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    strategy:
+      matrix:
+        python-version: ["3.8", "3.9", "3.10", "3.11"]
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Install Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install Rust
+        uses: actions-rs/toolchain@v1
+        with:
+          profile: minimal
+          toolchain: stable
+          override: true
+
+      - name: Install maturin
+        run: pip install maturin
+
+      - name: Download Npcap SDK
+        run: |
+          Invoke-WebRequest -Uri https://nmap.org/npcap/dist/npcap-sdk-1.13.zip -OutFile npcapsdk.zip
+          Expand-Archive npcapsdk.zip -DestinationPath $env:USERPROFILE\npcap-sdk
+
+      - name: Set Environment Variables
+        run: |
+          echo "INCLUDE=$env:INCLUDE;$env:USERPROFILE\npcap-sdk\Include" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          echo "LIB=$env:LIB;$env:USERPROFILE\npcap-sdk\Lib\x64" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build wheel
+        run: maturin build --release
+
+      - name: Upload wheel
+        uses: actions/upload-artifact@v3
+        with:
+          name: windows-wheels
+          path: target/wheels/*.whl

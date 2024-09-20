@@ -1,6 +1,20 @@
-#import py_pnet
+import ctypes
+import os
+import platform
+import sys
+import time
 
-import time,sys, time
+if platform.system() == 'Windows':
+    if platform.architecture()[0] == '64bit':
+        system_dir = os.path.join(os.environ['SystemRoot'], 'System32')
+    else:
+        system_dir = os.path.join(os.environ['SystemRoot'], 'SysWOW64')
+
+    # Load the DLLs
+    ctypes.windll.LoadLibrary(os.path.join(system_dir, 'Packet.dll'))
+    ctypes.windll.LoadLibrary(os.path.join(system_dir, 'wpcap.dll'))
+
+
 print(sys.version)
 sys.path.insert(0, "/Applications/Code/Code/py_pnet")
 #import py_pnet

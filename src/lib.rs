@@ -21,7 +21,7 @@ impl PacketSniffer {
             stop_flag: Arc::new(Mutex::new(false)),
         }
     }
-
+    
     fn sniff(&self, py: Python, callback: PyObject) -> PyResult<()> {
         let stop_flag = self.stop_flag.clone();
         let interface_name = self.interface_name.clone();
@@ -106,15 +106,19 @@ fn capture_packets(
     Ok(())
 }
 
+#[pyfunction]
+fn list_interfaces() -> PyResult<Vec<String>> {
+    let interfaces = pnet::datalink::interfaces();
+    let interface_names = interfaces
+        .into_iter()
+        .map(|iface| iface.name)
+        .collect::<Vec<String>>();
+    Ok(interface_names)
+}
+
 #[pymodule]
 fn py_pnet( m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<PacketSniffer>()?;
+    m.add_function(wrap_pyfunction!(list_interfaces, m)?)?;
     Ok(())
 }
-
-
-// #[pymodule]
-// fn pnet_sniffer(py: Python, m: &PyModule) -> PyResult<()> {
-//     m.add_class::<PacketSniffer>()?;
-//     Ok(())
-// }

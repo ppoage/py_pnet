@@ -8,17 +8,16 @@ use pnet::packet::udp::UdpPacket;
 use pnet::packet::Packet;
 use pnet::packet::ip::IpNextHeaderProtocols;
 
-
 #[pyclass]
-struct PacketSniffer {
+struct DataLinkInterface {
     interface_name: String,
 }
 
 #[pymethods]
-impl PacketSniffer {
+impl DataLinkInterface {
     #[new]
     fn new(interface_name: String) -> Self {
-        PacketSniffer { interface_name }
+        DataLinkInterface { interface_name }
     }
 
     #[pyo3(signature = (
@@ -177,7 +176,83 @@ impl PacketSniffer {
         let py_packets = PyList::new_bound(py, packets);
         Ok(py_packets.into())
     }
+
+    #[pyo3(signature = (packet, num_packets=None))]
+    fn transmit_packet(
+        &self,
+        packet: &[u8],
+        num_packets: Option<usize>,
+    ) -> PyResult<()> {
+        // Find the network interface
+        let interface = {
+            if cfg!(target_os = "windows") {
+                datalink::interfaces()
+                    .into_iter()
+                    .find(|iface| iface.description == self.interface_name)
+            } else {
+                datalink::interfaces()
+                    .into_iter()
+                    .find(|iface| iface.name == self.interface_name)
+            }
+        }
+        .ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "No such network interface: {}",
+                self.interface_name
+            ))
+        })?;
+
+        // Create a channel to send on
+        let (mut tx, _) = match datalink::channel(&interface, Default::default()) {
+            Ok(Ethernet(tx, _rx)) => (tx, _rx),
+            Ok(_) => {
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Unhandled channel type",
+                ))
+            }
+            Err(e) => {
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Unable to create channel: {}",
+                    e
+                )))
+            }
+        };
+
+        let packet_bytes = packet;
+
+        let packet_size = packet_bytes.len();
+
+        let num_packets = num_packets.unwrap_or(1);
+        let num_packets = if num_packets < 1 { 1 } else { num_packets };
+
+        for _ in 0..num_packets {
+            let send_result = tx.build_and_send(1, packet_size, &mut |new_packet: &mut [u8]| {
+                new_packet.copy_from_slice(packet_bytes);
+            });
+        
+            match send_result {
+                Some(Ok(())) => {
+                    // Packet sent successfully
+                }
+                Some(Err(e)) => {
+                    return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                        "Failed to send packet: {}",
+                        e
+                    )));
+                }
+                None => {
+                    return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                        "DataLinkSender has been closed",
+                    ));
+                }
+            }
+        }
+
+        Ok(())
+    }
 }
+
+    
 
 fn create_packet_info(
     py: Python,
@@ -215,7 +290,7 @@ fn list_interfaces() -> PyResult<Vec<String>> {
 
 #[pymodule]
 fn py_pnet(m: &Bound<'_, PyModule>) -> PyResult<()> {
-    m.add_class::<PacketSniffer>()?;
+    m.add_class::<DataLinkInterface>()?;
     m.add_function(wrap_pyfunction!(list_interfaces, m)?)?;
     Ok(())
 }

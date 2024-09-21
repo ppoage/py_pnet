@@ -1,17 +1,16 @@
-name: Build Windows Wheels
+name: Build and Release Windows Wheels
 
 on:
   push:
-    branches: [main]
-  pull_request:
-    branches: [main]
+    tags:
+      - 'v*'
 
 jobs:
   build-windows:
     runs-on: windows-latest
     strategy:
       matrix:
-        python-version: [ "3.10", "3.11"]
+        python-version: ["3.10", "3.11"]
     steps:
       - uses: actions/checkout@v3
 
@@ -43,9 +42,27 @@ jobs:
       - name: Build wheel
         run: maturin build --release
 
-      - name: Upload wheel
+      - name: Upload wheel artifact
         uses: actions/upload-artifact@v3
         with:
-          name: windows-wheels
+          name: windows-wheel-${{ matrix.python-version }}
           path: target/wheels/*.whl
+
+  release:
+    needs: build-windows
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v3
+
+      - name: Download wheel artifacts
+        uses: actions/download-artifact@v3
+        with:
+          path: ./wheels
+
+      - name: Create Release and Upload Wheels
+        uses: softprops/action-gh-release@v1
+        with:
+          files: ./wheels/**/*.whl
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 

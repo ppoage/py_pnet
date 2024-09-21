@@ -41,15 +41,23 @@ impl PacketSniffer {
         dst_ip: Option<&str>,
     ) -> PyResult<PyObject> {
         // Find the network interface
-        let interface = datalink::interfaces()
-            .into_iter()
-            .find(|iface| iface.name == self.interface_name)
-            .ok_or_else(|| {
-                PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                    "No such network interface: {}",
-                    self.interface_name
-                ))
-            })?;
+        let interface = {
+            if cfg!(target_os = "windows") {
+                datalink::interfaces()
+                    .into_iter()
+                    .find(|iface| iface.description == self.interface_name)
+            } else {
+                datalink::interfaces()
+                    .into_iter()
+                    .find(|iface| iface.name == self.interface_name)
+            }
+        }
+        .ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "No such network interface: {}",
+                self.interface_name
+            ))
+        })?;
 
         // Create a channel to receive on
         let (_, mut rx) = match datalink::channel(&interface, Default::default()) {

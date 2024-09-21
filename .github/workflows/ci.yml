@@ -5,6 +5,13 @@ on:
     tags:
       - 'v*'
   workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Tag name for the release (e.g., v1.0.0)'
+        required: true
+      release_name:
+        description: 'Release name (optional)'
+        required: false
 
 jobs:
   build-windows:
@@ -60,10 +67,30 @@ jobs:
         with:
           path: ./wheels
 
+      - name: Set Release Tag and Name
+        id: get_release_info
+        shell: bash
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            TAG_NAME="${{ github.event.inputs.tag_name }}"
+            RELEASE_NAME="${{ github.event.inputs.release_name }}"
+            if [ -z "$RELEASE_NAME" ]; then
+              RELEASE_NAME="$TAG_NAME"
+            fi
+          else
+            TAG_NAME="${GITHUB_REF##*/}"
+            RELEASE_NAME="${GITHUB_REF##*/}"
+          fi
+          echo "Tag Name: $TAG_NAME"
+          echo "Release Name: $RELEASE_NAME"
+          echo "TAG_NAME=$TAG_NAME" >> $GITHUB_ENV
+          echo "RELEASE_NAME=$RELEASE_NAME" >> $GITHUB_ENV
+
       - name: Create Release and Upload Wheels
         uses: softprops/action-gh-release@v1
         with:
+          tag_name: ${{ env.TAG_NAME }}
+          release_name: ${{ env.RELEASE_NAME }}
           files: ./wheels/**/*.whl
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-

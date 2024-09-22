@@ -1,12 +1,19 @@
 use pyo3::prelude::*;
 use pyo3::types::{PyBytes, PyDict, PyList};
-use pnet::datalink::{self, Channel::Ethernet};
-use pnet::packet::ethernet::{EtherTypes, EthernetPacket};
-use pnet::packet::ipv4::Ipv4Packet;
-use pnet::packet::tcp::TcpPacket;
-use pnet::packet::udp::UdpPacket;
-use pnet::packet::Packet;
+use pnet::datalink::{self, Channel::Ethernet, MacAddr};
+use pnet::packet::ethernet::{MutableEthernetPacket, EtherTypes, EthernetPacket};
 use pnet::packet::ip::IpNextHeaderProtocols;
+use pnet::packet::ipv4::{MutableIpv4Packet, Ipv4Packet};
+use pnet::packet::udp::{MutableUdpPacket, UdpPacket};
+use pnet::packet::tcp::TcpPacket;
+use pnet::packet::Packet;
+use std::net::Ipv4Addr;
+use std::str::FromStr;
+
+
+
+
+
 
 #[pyclass]
 struct DataLinkInterface {
@@ -19,6 +26,7 @@ impl DataLinkInterface {
     fn new(interface_name: String) -> Self {
         DataLinkInterface { interface_name }
     }
+
 
     #[pyo3(signature = (
         num_packets,
@@ -177,12 +185,45 @@ impl DataLinkInterface {
         Ok(py_packets.into())
     }
 
-    #[pyo3(signature = (packet, num_packets=None))]
+    #[pyo3(signature = (payload, src_mac, src_ip, src_port, dst_mac, dst_ip, dst_port))]
     fn transmit_packet(
         &self,
-        packet: &[u8],
-        num_packets: Option<usize>,
+        payload: &[u8],
+        src_mac: &str,
+        src_ip: &str,
+        src_port: u16,
+        dst_mac: &str,
+        dst_ip: &str,
+        dst_port: u16,
     ) -> PyResult<()> {
+        // Parse IP addresses
+        let src_ip: Ipv4Addr = src_ip.parse().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Invalid source IP address: {}",
+                e
+            ))
+        })?;
+        let dst_ip: Ipv4Addr = dst_ip.parse().map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Invalid destination IP address: {}",
+                e
+            ))
+        })?;
+
+        // Parse MAC addresses
+        let src_mac = MacAddr::from_str(src_mac).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Invalid source MAC address: {}",
+                e
+            ))
+        })?;
+        let dst_mac = MacAddr::from_str(dst_mac).map_err(|e| {
+            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+                "Invalid destination MAC address: {}",
+                e
+            ))
+        })?;
+
         // Find the network interface
         let interface = {
             if cfg!(target_os = "windows") {
@@ -202,9 +243,69 @@ impl DataLinkInterface {
             ))
         })?;
 
+        // Create a new UDP packet
+        let mut udp_buffer = vec![0u8; MutableUdpPacket::minimum_packet_size() + payload.len()];
+        let mut udp_packet = MutableUdpPacket::new(&mut udp_buffer).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to create UDP packet")
+        })?;
+
+        udp_packet.set_source(src_port);
+        udp_packet.set_destination(dst_port);
+        udp_packet.set_length((MutableUdpPacket::minimum_packet_size() + payload.len()) as u16);
+        udp_packet.set_payload(payload);
+
+        // Calculate UDP checksum
+        let checksum = pnet::packet::udp::ipv4_checksum(
+            &udp_packet.to_immutable(),
+            &src_ip,
+            &dst_ip,
+        );
+        udp_packet.set_checksum(checksum);
+
+        // Create a new IPv4 packet
+        let mut ip_buffer = vec![
+            0u8;
+            MutableIpv4Packet::minimum_packet_size() + udp_packet.packet().len()
+        ];
+        let mut ip_packet = MutableIpv4Packet::new(&mut ip_buffer).ok_or_else(|| {
+            PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to create IPv4 packet")
+        })?;
+
+        ip_packet.set_version(4);
+        ip_packet.set_header_length(5);
+        ip_packet.set_total_length(
+            (MutableIpv4Packet::minimum_packet_size() + udp_packet.packet().len()) as u16,
+        );
+        ip_packet.set_ttl(64);
+        ip_packet.set_next_level_protocol(IpNextHeaderProtocols::Udp);
+        ip_packet.set_source(src_ip);
+        ip_packet.set_destination(dst_ip);
+        ip_packet.set_payload(udp_packet.packet());
+
+        // Calculate IPv4 checksum
+        let checksum = pnet::packet::ipv4::checksum(&ip_packet.to_immutable());
+        ip_packet.set_checksum(checksum);
+
+        // Create a new Ethernet packet
+        let mut ethernet_buffer = vec![
+            0u8;
+            MutableEthernetPacket::minimum_packet_size() + ip_packet.packet().len()
+        ];
+        let mut ethernet_packet =
+            MutableEthernetPacket::new(&mut ethernet_buffer).ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Failed to create Ethernet packet",
+                )
+            })?;
+
+        ethernet_packet.set_destination(dst_mac);
+        ethernet_packet.set_source(src_mac);
+        ethernet_packet.set_ethertype(pnet::packet::ethernet::EtherTypes::Ipv4);
+        ethernet_packet.set_payload(ip_packet.packet());
+
         // Create a channel to send on
-        let (mut tx, _) = match datalink::channel(&interface, Default::default()) {
-            Ok(Ethernet(tx, _rx)) => (tx, _rx),
+        let mut tx = match datalink::channel(&interface, Default::default()) {
+            Ok(Ethernet(tx, _rx)) => tx,
             Ok(_) => {
                 return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
                     "Unhandled channel type",
@@ -218,35 +319,17 @@ impl DataLinkInterface {
             }
         };
 
-        let packet_bytes = packet;
-
-        let packet_size = packet_bytes.len();
-
-        let num_packets = num_packets.unwrap_or(1);
-        let num_packets = if num_packets < 1 { 1 } else { num_packets };
-
-        for _ in 0..num_packets {
-            let send_result = tx.build_and_send(1, packet_size, &mut |new_packet: &mut [u8]| {
-                new_packet.copy_from_slice(packet_bytes);
-            });
-        
-            match send_result {
-                Some(Ok(())) => {
-                    // Packet sent successfully
-                }
-                Some(Err(e)) => {
-                    return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
-                        "Failed to send packet: {}",
-                        e
-                    )));
-                }
-                None => {
-                    return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
-                        "DataLinkSender has been closed",
-                    ));
-                }
-            }
-        }
+        // Send the packet
+        tx.send_to(ethernet_packet.packet(), None)
+            .ok_or_else(|| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>("Failed to send packet")
+            })?
+            .map_err(|e| {
+                PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Failed to send packet: {}",
+                    e
+                ))
+            })?;
 
         Ok(())
     }

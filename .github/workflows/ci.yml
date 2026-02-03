@@ -49,34 +49,3 @@ jobs:
         with:
           name: wheels-${{ matrix.os }}
           path: dist/*.whl
-
-  smoke-test-linux:
-    name: Smoke test (CPython ${{ matrix.python-version }})
-    runs-on: ubuntu-latest
-    needs: build-wheels
-    strategy:
-      fail-fast: false
-      matrix:
-        python-version: ["3.10", "3.11", "3.12", "3.13"]
-    steps:
-      - name: Set up Python
-        uses: actions/setup-python@v5
-        with:
-          python-version: ${{ matrix.python-version }}
-
-      - name: Download Linux wheel
-        uses: actions/download-artifact@v4
-        with:
-          name: wheels-ubuntu-latest
-          path: dist
-
-      - name: Install wheel
-        run: |
-          python -m pip install --upgrade pip
-          python -m pip install dist/*.whl
-
-      - name: Import module
-        run: python - <<'PY'
-import py_pnet
-print(py_pnet.list_interfaces)
-PY

@@ -56,6 +56,9 @@ jobs:
           COMMIT_SHA='${{ steps.release_info.outputs.commit_sha }}'
           RELEASE_NAME='${{ steps.release_info.outputs.release_name }}'
 
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
           if git rev-parse "$TAG_NAME" >/dev/null 2>&1; then
             echo "Tag $TAG_NAME already exists."
             exit 1

@@ -9,6 +9,10 @@ use pnet::packet::tcp::TcpPacket;
 use pnet::packet::Packet;
 use std::net::Ipv4Addr;
 use std::str::FromStr;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc};
+use std::thread;
+use std::time::Duration;
 
 
 
@@ -48,23 +52,7 @@ impl DataLinkInterface {
         dst_ip: Option<&str>,
     ) -> PyResult<PyObject> {
         // Find the network interface
-        let interface = {
-            if cfg!(target_os = "windows") {
-                datalink::interfaces()
-                    .into_iter()
-                    .find(|iface| iface.description == self.interface_name)
-            } else {
-                datalink::interfaces()
-                    .into_iter()
-                    .find(|iface| iface.name == self.interface_name)
-            }
-        }
-        .ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "No such network interface: {}",
-                self.interface_name
-            ))
-        })?;
+        let interface = find_interface(&self.interface_name)?;
 
         // Create a channel to receive on
         let (_, mut rx) = match datalink::channel(&interface, Default::default()) {
@@ -87,89 +75,16 @@ impl DataLinkInterface {
         while packets.len() < num_packets {
             match rx.next() {
                 Ok(packet) => {
-                    // Parse the Ethernet packet
-                    if let Some(ethernet) = EthernetPacket::new(packet) {
-                        // Apply MAC address filters
-                        if let Some(src_mac_filter) = src_mac {
-                            if ethernet.get_source().to_string() != src_mac_filter {
-                                continue;
-                            }
-                        }
-                        if let Some(dst_mac_filter) = dst_mac {
-                            if ethernet.get_destination().to_string() != dst_mac_filter {
-                                continue;
-                            }
-                        }
-
-                        match ethernet.get_ethertype() {
-                            EtherTypes::Ipv4 => {
-                                // Parse IPv4 packet
-                                if let Some(ipv4_packet) = Ipv4Packet::new(ethernet.payload()) {
-                                    // Apply IP address filters
-                                    if let Some(src_ip_filter) = src_ip {
-                                        if ipv4_packet.get_source().to_string() != src_ip_filter {
-                                            continue;
-                                        }
-                                    }
-                                    if let Some(dst_ip_filter) = dst_ip {
-                                        if ipv4_packet.get_destination().to_string()
-                                            != dst_ip_filter
-                                        {
-                                            continue;
-                                        }
-                                    }
-
-                                    let next_proto = ipv4_packet.get_next_level_protocol();
-
-                                    // Apply protocol filter
-                                    if let Some(proto_filter) = protocol {
-                                        if proto_filter.eq_ignore_ascii_case("TCP")
-                                            && next_proto != IpNextHeaderProtocols::Tcp
-                                        {
-                                            continue;
-                                        } else if proto_filter.eq_ignore_ascii_case("UDP")
-                                            && next_proto != IpNextHeaderProtocols::Udp
-                                        {
-                                            continue;
-                                        }
-                                    }
-
-                                    // Parse transport layer if needed
-                                    let transport_payload = if next_proto == IpNextHeaderProtocols::Tcp {
-                                        if let Some(tcp_packet) = TcpPacket::new(ipv4_packet.payload()) {
-                                            tcp_packet.payload().to_vec()
-                                        } else {
-                                            continue;
-                                        }
-                                    } else if next_proto == IpNextHeaderProtocols::Udp {
-                                        if let Some(udp_packet) = UdpPacket::new(ipv4_packet.payload()) {
-                                            udp_packet.payload().to_vec()
-                                        } else {
-                                            continue;
-                                        }
-                                    } else {
-                                        ipv4_packet.payload().to_vec()
-                                    };
-
-                                    // Prepare packet data
-                                    let packet_info = create_packet_info(
-                                        py,
-                                        &ethernet,
-                                        Some(&ipv4_packet),
-                                        &transport_payload,
-                                    )?;
-                                    packets.push(packet_info);
-                                }
-                            }
-                            EtherTypes::Ipv6 => {
-                                // Handle IPv6 if needed
-                                continue;
-                            }
-                            _ => {
-                                // Other EtherTypes
-                                continue;
-                            }
-                        }
+                    if let Some(packet_info) = build_packet_info_from_frame(
+                        packet,
+                        protocol,
+                        src_mac,
+                        dst_mac,
+                        src_ip,
+                        dst_ip,
+                    ) {
+                        let packet_info = packet_info_to_py(py, &packet_info)?;
+                        packets.push(packet_info);
                     }
                 }
                 Err(e) => {
@@ -225,23 +140,7 @@ impl DataLinkInterface {
         })?;
 
         // Find the network interface
-        let interface = {
-            if cfg!(target_os = "windows") {
-                datalink::interfaces()
-                    .into_iter()
-                    .find(|iface| iface.description == self.interface_name)
-            } else {
-                datalink::interfaces()
-                    .into_iter()
-                    .find(|iface| iface.name == self.interface_name)
-            }
-        }
-        .ok_or_else(|| {
-            PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
-                "No such network interface: {}",
-                self.interface_name
-            ))
-        })?;
+        let interface = find_interface(&self.interface_name)?;
 
         // Create a new UDP packet
         let mut udp_buffer = vec![0u8; MutableUdpPacket::minimum_packet_size() + payload.len()];
@@ -335,30 +234,364 @@ impl DataLinkInterface {
     }
 }
 
-    
+struct PacketInfo {
+    src_mac: String,
+    dst_mac: String,
+    ethertype: String,
+    src_ip: Option<String>,
+    dst_ip: Option<String>,
+    protocol: Option<String>,
+    payload: Vec<u8>,
+}
 
-fn create_packet_info(
-    py: Python,
-    ethernet: &EthernetPacket,
-    ipv4: Option<&Ipv4Packet>,
-    payload: &[u8],
-) -> PyResult<PyObject> {
-    let packet_info = PyDict::new_bound(py);
-    packet_info.set_item("src_mac", ethernet.get_source().to_string())?;
-    packet_info.set_item("dst_mac", ethernet.get_destination().to_string())?;
-    packet_info.set_item("ethertype", format!("{:?}", ethernet.get_ethertype()))?;
+fn build_packet_info_from_frame(
+    frame: &[u8],
+    protocol: Option<&str>,
+    src_mac: Option<&str>,
+    dst_mac: Option<&str>,
+    src_ip: Option<&str>,
+    dst_ip: Option<&str>,
+) -> Option<PacketInfo> {
+    let ethernet = EthernetPacket::new(frame)?;
 
-    if let Some(ipv4_packet) = ipv4 {
-        packet_info.set_item("src_ip", ipv4_packet.get_source().to_string())?;
-        packet_info.set_item("dst_ip", ipv4_packet.get_destination().to_string())?;
-        packet_info.set_item(
-            "protocol",
-            format!("{:?}", ipv4_packet.get_next_level_protocol()),
-        )?;
+    if let Some(src_mac_filter) = src_mac {
+        if ethernet.get_source().to_string() != src_mac_filter {
+            return None;
+        }
     }
-    packet_info.set_item("payload", PyBytes::new_bound(py, payload))?;
+    if let Some(dst_mac_filter) = dst_mac {
+        if ethernet.get_destination().to_string() != dst_mac_filter {
+            return None;
+        }
+    }
 
+    match ethernet.get_ethertype() {
+        EtherTypes::Ipv4 => {
+            let ipv4_packet = Ipv4Packet::new(ethernet.payload())?;
+
+            if let Some(src_ip_filter) = src_ip {
+                if ipv4_packet.get_source().to_string() != src_ip_filter {
+                    return None;
+                }
+            }
+            if let Some(dst_ip_filter) = dst_ip {
+                if ipv4_packet.get_destination().to_string() != dst_ip_filter {
+                    return None;
+                }
+            }
+
+            let next_proto = ipv4_packet.get_next_level_protocol();
+
+            if let Some(proto_filter) = protocol {
+                if proto_filter.eq_ignore_ascii_case("TCP")
+                    && next_proto != IpNextHeaderProtocols::Tcp
+                {
+                    return None;
+                } else if proto_filter.eq_ignore_ascii_case("UDP")
+                    && next_proto != IpNextHeaderProtocols::Udp
+                {
+                    return None;
+                }
+            }
+
+            let transport_payload = if next_proto == IpNextHeaderProtocols::Tcp {
+                TcpPacket::new(ipv4_packet.payload())
+                    .map(|tcp_packet| tcp_packet.payload().to_vec())?
+            } else if next_proto == IpNextHeaderProtocols::Udp {
+                UdpPacket::new(ipv4_packet.payload())
+                    .map(|udp_packet| udp_packet.payload().to_vec())?
+            } else {
+                ipv4_packet.payload().to_vec()
+            };
+
+            Some(PacketInfo {
+                src_mac: ethernet.get_source().to_string(),
+                dst_mac: ethernet.get_destination().to_string(),
+                ethertype: format!("{:?}", ethernet.get_ethertype()),
+                src_ip: Some(ipv4_packet.get_source().to_string()),
+                dst_ip: Some(ipv4_packet.get_destination().to_string()),
+                protocol: Some(format!("{:?}", next_proto)),
+                payload: transport_payload,
+            })
+        }
+        EtherTypes::Ipv6 => None,
+        _ => None,
+    }
+}
+
+fn packet_info_to_py(py: Python, info: &PacketInfo) -> PyResult<PyObject> {
+    let packet_info = PyDict::new_bound(py);
+    packet_info.set_item("src_mac", &info.src_mac)?;
+    packet_info.set_item("dst_mac", &info.dst_mac)?;
+    packet_info.set_item("ethertype", &info.ethertype)?;
+    if let Some(ref src_ip) = info.src_ip {
+        packet_info.set_item("src_ip", src_ip)?;
+    }
+    if let Some(ref dst_ip) = info.dst_ip {
+        packet_info.set_item("dst_ip", dst_ip)?;
+    }
+    if let Some(ref protocol) = info.protocol {
+        packet_info.set_item("protocol", protocol)?;
+    }
+    packet_info.set_item("payload", PyBytes::new_bound(py, &info.payload))?;
     Ok(packet_info.into())
+}
+
+fn find_interface(interface_name: &str) -> PyResult<datalink::NetworkInterface> {
+    let interface = if cfg!(target_os = "windows") {
+        datalink::interfaces()
+            .into_iter()
+            .find(|iface| iface.description == interface_name)
+    } else {
+        datalink::interfaces()
+            .into_iter()
+            .find(|iface| iface.name == interface_name)
+    };
+
+    interface.ok_or_else(|| {
+        PyErr::new::<pyo3::exceptions::PyValueError, _>(format!(
+            "No such network interface: {}",
+            interface_name
+        ))
+    })
+}
+
+#[pyclass]
+struct StreamingDataLink {
+    interface_name: String,
+    stop_flag: Arc<AtomicBool>,
+    running: Arc<AtomicBool>,
+    capture_thread: Option<thread::JoinHandle<()>>,
+    callback_thread: Option<thread::JoinHandle<()>>,
+}
+
+#[pymethods]
+impl StreamingDataLink {
+    #[new]
+    fn new(interface_name: String) -> Self {
+        StreamingDataLink {
+            interface_name,
+            stop_flag: Arc::new(AtomicBool::new(false)),
+            running: Arc::new(AtomicBool::new(false)),
+            capture_thread: None,
+            callback_thread: None,
+        }
+    }
+
+    #[pyo3(signature = (
+        callback,
+        *,
+        batch_size = 1,
+        queue_capacity = 1024,
+        protocol = None,
+        src_mac = None,
+        dst_mac = None,
+        src_ip = None,
+        dst_ip = None
+    ))]
+    fn start(
+        &mut self,
+        py: Python,
+        callback: PyObject,
+        batch_size: usize,
+        queue_capacity: usize,
+        protocol: Option<&str>,
+        src_mac: Option<&str>,
+        dst_mac: Option<&str>,
+        src_ip: Option<&str>,
+        dst_ip: Option<&str>,
+    ) -> PyResult<()> {
+        if batch_size == 0 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "batch_size must be >= 1",
+            ));
+        }
+        if queue_capacity == 0 {
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "queue_capacity must be >= 1",
+            ));
+        }
+        if self.running.swap(true, Ordering::SeqCst) {
+            return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                "StreamingDataLink is already running",
+            ));
+        }
+        if !callback.bind(py).is_callable() {
+            self.running.store(false, Ordering::SeqCst);
+            return Err(PyErr::new::<pyo3::exceptions::PyValueError, _>(
+                "callback must be callable",
+            ));
+        }
+
+        let interface = find_interface(&self.interface_name)?;
+        let config = datalink::Config {
+            read_timeout: Some(Duration::from_millis(100)),
+            ..Default::default()
+        };
+        match datalink::channel(&interface, config) {
+            Ok(Ethernet(_tx, _rx)) => {}
+            Ok(_) => {
+                self.running.store(false, Ordering::SeqCst);
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(
+                    "Unhandled channel type",
+                ));
+            }
+            Err(e) => {
+                self.running.store(false, Ordering::SeqCst);
+                return Err(PyErr::new::<pyo3::exceptions::PyRuntimeError, _>(format!(
+                    "Unable to create channel: {}",
+                    e
+                )));
+            }
+        }
+
+        self.stop_flag.store(false, Ordering::SeqCst);
+
+        let (sender, receiver) = mpsc::sync_channel::<Vec<PacketInfo>>(queue_capacity);
+        let stop_flag_capture = Arc::clone(&self.stop_flag);
+        let running_capture = Arc::clone(&self.running);
+        let interface_name = self.interface_name.clone();
+        let protocol = protocol.map(|value| value.to_string());
+        let src_mac = src_mac.map(|value| value.to_string());
+        let dst_mac = dst_mac.map(|value| value.to_string());
+        let src_ip = src_ip.map(|value| value.to_string());
+        let dst_ip = dst_ip.map(|value| value.to_string());
+
+        let capture_thread = thread::spawn(move || {
+            let interface = match find_interface(&interface_name) {
+                Ok(interface) => interface,
+                Err(_) => {
+                    running_capture.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            let config = datalink::Config {
+                read_timeout: Some(Duration::from_millis(100)),
+                ..Default::default()
+            };
+            let mut rx = match datalink::channel(&interface, config) {
+                Ok(Ethernet(_tx, rx)) => rx,
+                _ => {
+                    running_capture.store(false, Ordering::SeqCst);
+                    return;
+                }
+            };
+
+            let mut batch = Vec::with_capacity(batch_size);
+
+            while !stop_flag_capture.load(Ordering::Relaxed) {
+                match rx.next() {
+                    Ok(packet) => {
+                        if let Some(packet_info) = build_packet_info_from_frame(
+                            packet,
+                            protocol.as_deref(),
+                            src_mac.as_deref(),
+                            dst_mac.as_deref(),
+                            src_ip.as_deref(),
+                            dst_ip.as_deref(),
+                        ) {
+                            batch.push(packet_info);
+                        } else {
+                            continue;
+                        }
+
+                        if batch.len() >= batch_size {
+                            let to_send = std::mem::take(&mut batch);
+                            match sender.try_send(to_send) {
+                                Ok(()) => {
+                                    batch = Vec::with_capacity(batch_size);
+                                }
+                                Err(mpsc::TrySendError::Full(_dropped)) => {
+                                    batch = Vec::with_capacity(batch_size);
+                                }
+                                Err(mpsc::TrySendError::Disconnected(_batch)) => {
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        if e.kind() == std::io::ErrorKind::TimedOut {
+                            continue;
+                        }
+                        break;
+                    }
+                }
+            }
+
+            if !batch.is_empty() {
+                let _ = sender.try_send(batch);
+            }
+
+            running_capture.store(false, Ordering::SeqCst);
+        });
+
+        let stop_flag_callback = Arc::clone(&self.stop_flag);
+        let running_callback = Arc::clone(&self.running);
+        let callback_thread = thread::spawn(move || {
+            let callback = callback;
+
+            while let Ok(batch) = receiver.recv() {
+                if batch.is_empty() {
+                    continue;
+                }
+                let call_result = Python::with_gil(|py| -> PyResult<()> {
+                    if batch_size == 1 {
+                        let packet_info = packet_info_to_py(py, &batch[0])?;
+                        callback.call1(py, (packet_info,))?;
+                    } else {
+                        let mut packets = Vec::with_capacity(batch.len());
+                        for info in &batch {
+                            packets.push(packet_info_to_py(py, info)?);
+                        }
+                        let py_packets = PyList::new_bound(py, packets);
+                        callback.call1(py, (py_packets,))?;
+                    }
+                    Ok(())
+                });
+
+                if let Err(err) = call_result {
+                    Python::with_gil(|py| {
+                        err.print(py);
+                    });
+                    stop_flag_callback.store(true, Ordering::SeqCst);
+                    break;
+                }
+            }
+
+            running_callback.store(false, Ordering::SeqCst);
+        });
+
+        self.capture_thread = Some(capture_thread);
+        self.callback_thread = Some(callback_thread);
+
+        Ok(())
+    }
+
+    fn stop(&mut self) -> PyResult<()> {
+        self.stop_internal();
+        Ok(())
+    }
+}
+
+impl StreamingDataLink {
+    fn stop_internal(&mut self) {
+        self.stop_flag.store(true, Ordering::SeqCst);
+        if let Some(handle) = self.capture_thread.take() {
+            let _ = handle.join();
+        }
+        if let Some(handle) = self.callback_thread.take() {
+            let _ = handle.join();
+        }
+        self.running.store(false, Ordering::SeqCst);
+    }
+}
+
+impl Drop for StreamingDataLink {
+    fn drop(&mut self) {
+        self.stop_internal();
+    }
 }
 
 #[pyfunction]
@@ -374,6 +607,7 @@ fn list_interfaces() -> PyResult<Vec<String>> {
 #[pymodule]
 fn py_pnet(m: &Bound<'_, PyModule>) -> PyResult<()> {
     m.add_class::<DataLinkInterface>()?;
+    m.add_class::<StreamingDataLink>()?;
     m.add_function(wrap_pyfunction!(list_interfaces, m)?)?;
     Ok(())
 }

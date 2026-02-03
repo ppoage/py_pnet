@@ -50,8 +50,8 @@ def udp_transmit():
     )
 
 def udp_receive():
-        # Replace with your interface name
-    interface_name = "en0"  # Update this to match your interface
+    # Replace with your interface name
+    interface_name = "en0" 
 
     sniffer = DataLinkInterface(interface_name)
 
